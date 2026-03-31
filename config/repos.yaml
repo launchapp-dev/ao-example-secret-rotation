@@ -1,0 +1,28 @@
+repositories:
+  - repo: myorg/api-service
+    github_org: myorg
+    scan_branches: [main, develop]
+    secret_types: [api-key, database-url, jwt-secret]
+    owner: backend-team
+    criticality: high
+
+  - repo: myorg/web-frontend
+    github_org: myorg
+    scan_branches: [main]
+    secret_types: [api-key, oauth-client-secret]
+    owner: frontend-team
+    criticality: medium
+
+  - repo: myorg/infrastructure
+    github_org: myorg
+    scan_branches: [main]
+    secret_types: [ssh-key, tls-cert, aws-access-key]
+    owner: devops-team
+    criticality: critical
+
+  - repo: myorg/data-pipeline
+    github_org: myorg
+    scan_branches: [main]
+    secret_types: [database-url, aws-access-key, api-key]
+    owner: data-team
+    criticality: high

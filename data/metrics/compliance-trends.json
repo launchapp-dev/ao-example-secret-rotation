@@ -1,0 +1,23 @@
+{
+  "2026-01": {
+    "compliance_rate": 100,
+    "violations_count": 0,
+    "rotated_count": 3,
+    "total_secrets": 4,
+    "generated_at": "2026-01-31T09:00:00Z"
+  },
+  "2026-02": {
+    "compliance_rate": 100,
+    "violations_count": 0,
+    "rotated_count": 2,
+    "total_secrets": 4,
+    "generated_at": "2026-02-28T09:00:00Z"
+  },
+  "2026-03": {
+    "compliance_rate": 75,
+    "violations_count": 1,
+    "rotated_count": 3,
+    "total_secrets": 4,
+    "generated_at": "2026-03-31T09:00:00Z"
+  }
+}

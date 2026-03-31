@@ -1,0 +1,33 @@
+health_checks:
+  api-service:
+    url: "https://api.example.com/health"
+    expected_status: 200
+    timeout_seconds: 10
+    criticality: high
+    repo: myorg/api-service
+
+  web-frontend:
+    url: "https://www.example.com"
+    expected_status: 200
+    timeout_seconds: 10
+    criticality: medium
+    repo: myorg/web-frontend
+
+  data-pipeline-api:
+    url: "https://data-api.example.com/ping"
+    expected_status: 200
+    timeout_seconds: 15
+    criticality: high
+    repo: myorg/data-pipeline
+
+  github-actions-api-service:
+    method: gh-workflow
+    repo: myorg/api-service
+    check_last_n_runs: 3
+    criticality: high
+
+  github-actions-infrastructure:
+    method: gh-workflow
+    repo: myorg/infrastructure
+    check_last_n_runs: 3
+    criticality: critical

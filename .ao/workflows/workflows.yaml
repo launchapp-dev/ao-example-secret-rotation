@@ -1,0 +1,80 @@
+default_workflow_ref: secret-audit
+
+workflows:
+  - id: secret-audit
+    name: "Daily Secret Audit"
+    description: "Scans repos for exposed/expiring secrets, classifies findings, plans rotations, and generates daily alert"
+    phases:
+      - scan-secrets
+      - analyze-findings:
+          on_verdict:
+            all-clear:
+              target: generate-alerts
+            action-needed:
+              target: plan-rotations
+      - plan-rotations:
+          on_verdict:
+            rotations-planned:
+              target: generate-alerts
+            escalation-needed:
+              target: generate-alerts
+      - generate-alerts
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: false
+        auto_merge: false
+
+  - id: rotate-secret
+    name: "Rotate Single Secret"
+    description: "On-demand rotation of a single credential: generate, update configs, verify health, revoke old"
+    phases:
+      - generate-credential
+      - update-configurations:
+          on_verdict:
+            updated:
+              target: run-health-checks
+            failed:
+              target: generate-credential
+          max_rework_attempts: 2
+      - run-health-checks
+      - verify-health:
+          on_verdict:
+            verified:
+              target: revoke-old-credential
+            degraded:
+              target: revoke-old-credential
+            failed:
+              target: update-configurations
+          max_rework_attempts: 2
+      - revoke-old-credential
+      - update-inventory
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: false
+        auto_merge: false
+
+  - id: weekly-rotation-batch
+    name: "Weekly Rotation Batch"
+    description: "Collects all scheduled rotations due in the next 14 days and queues individual rotate-secret workflows"
+    phases:
+      - collect-pending
+      - execute-batch:
+          on_verdict:
+            batch-queued:
+              target: batch-summary
+            batch-empty:
+              target: batch-summary
+      - batch-summary
+
+  - id: monthly-compliance-audit
+    name: "Monthly Compliance Audit"
+    description: "Deep scan, compliance report, risk assessment, and manual policy review gate"
+    phases:
+      - full-scan
+      - compliance-report
+      - risk-assessment
+      - approve-policy-changes

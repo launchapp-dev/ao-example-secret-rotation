@@ -1,0 +1,46 @@
+rotation_policy:
+  api-key:
+    max_age_days: 90
+    warning_threshold_days: 14
+    auto_rotate: true
+    rotation_method: openssl-token
+
+  database-url:
+    max_age_days: 180
+    warning_threshold_days: 30
+    auto_rotate: false
+    rotation_method: manual
+    notes: "Requires coordinated rollout — update all services simultaneously"
+
+  jwt-secret:
+    max_age_days: 30
+    warning_threshold_days: 7
+    auto_rotate: true
+    rotation_method: openssl-token
+
+  ssh-key:
+    max_age_days: 365
+    warning_threshold_days: 30
+    auto_rotate: true
+    rotation_method: ssh-keygen
+
+  tls-cert:
+    max_age_days: 365
+    warning_threshold_days: 30
+    auto_rotate: false
+    rotation_method: manual
+    notes: "Handled by cert-manager in Kubernetes — monitor expiry but do not auto-rotate"
+
+  aws-access-key:
+    max_age_days: 90
+    warning_threshold_days: 14
+    auto_rotate: true
+    rotation_method: gh-secret
+    notes: "New key created via AWS CLI, then set in GitHub Actions secrets"
+
+  oauth-client-secret:
+    max_age_days: 180
+    warning_threshold_days: 30
+    auto_rotate: false
+    rotation_method: manual
+    notes: "Requires coordination with OAuth provider — manual rotation"

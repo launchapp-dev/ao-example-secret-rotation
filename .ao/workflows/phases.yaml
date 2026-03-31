@@ -1,0 +1,376 @@
+phases:
+  # ─── Workflow 1: secret-audit (daily) ───────────────────────────────────────
+
+  scan-secrets:
+    mode: command
+    command:
+      program: bash
+      args: ["-c", "scripts/scan-secrets.sh 2>&1 | tee data/scan-results/latest.txt && echo 'Scan complete. Results in data/scan-results/latest.txt'"]
+      cwd_mode: project_root
+      timeout_secs: 300
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  analyze-findings:
+    mode: agent
+    agent: secret-auditor
+    directive: |
+      Read data/scan-results/latest.txt (the raw scan output) and data/inventory/secret-inventory.json
+      (the current known secret inventory). Also read config/rotation-policy.yaml for max_age_days per type
+      and config/repos.yaml for ownership information.
+
+      For each finding in the scan results:
+      1. Determine if it is a known secret (match by pattern + location) or a new discovery
+      2. Classify its status: exposed (found in committed code/history), valid, expiring, expired, or rotated
+      3. Calculate expires_at using created_at + max_age_days from rotation policy
+      4. Assign finding_severity based on config/secret-patterns.yaml severity fields
+
+      Update data/inventory/secret-inventory.json with all findings, adding new entries and
+      updating existing ones with current status. Write the updated file via filesystem MCP.
+
+      Then emit your decision contract JSON on the last line:
+      { "verdict": "all-clear" | "action-needed", "exposed_count": N, "expiring_count": N, "expired_count": N }
+    capabilities:
+      mutates_state: true
+      writes_files: true
+      requires_commit: false
+    decision_contract:
+      required_fields: [verdict, exposed_count, expiring_count, expired_count]
+
+  plan-rotations:
+    mode: agent
+    agent: rotation-planner
+    directive: |
+      The previous phase determined that action is needed. Read data/inventory/secret-inventory.json
+      and identify all secrets with status: exposed, expired, or expiring.
+
+      For each actionable secret:
+      1. Assign urgency: immediate (exposed/expired), scheduled (expires <14d), deferred (expires <30d)
+      2. Determine rotation_method based on secret type (from config/rotation-policy.yaml):
+         - api-key / jwt-secret: openssl-token
+         - tls-cert: openssl-cert
+         - ssh-key: ssh-keygen
+         - aws-access-key: gh-secret (update in GitHub Actions)
+         - oauth-client-secret: manual (auto_rotate: false)
+         - database-url: manual (auto_rotate: false)
+      3. Skip secrets where auto_rotate: false — flag them as exempt with a note
+
+      Write the full rotation plan to data/rotations/pending.json.
+      For every `immediate` secret, create a GitHub issue in the relevant repo using the GitHub MCP
+      with label "security" and title "URGENT: Rotate <type> credential in <repo>".
+
+      Emit your decision contract JSON on the last line:
+      { "verdict": "rotations-planned" | "escalation-needed", "immediate_count": N, "scheduled_count": N, "deferred_count": N }
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    decision_contract:
+      required_fields: [verdict, immediate_count, scheduled_count, deferred_count]
+
+  generate-alerts:
+    mode: agent
+    agent: compliance-reporter
+    directive: |
+      Read data/inventory/secret-inventory.json and data/rotations/pending.json.
+      Produce a daily alert report at reports/daily-alert.md.
+
+      Structure the report as:
+      1. Executive summary (1 paragraph: overall status, total secrets, counts by status)
+      2. IMMEDIATE ACTION REQUIRED section (exposed and expired secrets)
+      3. 7-day window (secrets expiring in 0-7 days)
+      4. 14-day window (secrets expiring in 8-14 days)
+      5. 30-day window (secrets expiring in 15-30 days)
+      6. All-clear section (secrets that are valid with >30 days remaining)
+
+      Each entry should include: secret_id, type, repo, owner team, and expires_at.
+      Write the report to reports/daily-alert.md via filesystem MCP.
+      Append a metrics entry to data/metrics/compliance-trends.json with today's date and counts.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  # ─── Workflow 2: rotate-secret (on-demand per credential) ──────────────────
+
+  generate-credential:
+    mode: command
+    command:
+      program: bash
+      args: ["-c", "scripts/generate-credential.sh {{dispatch_input}} 2>&1"]
+      cwd_mode: project_root
+      timeout_secs: 120
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  update-configurations:
+    mode: agent
+    agent: credential-rotator
+    directive: |
+      Read data/rotations/in-progress.json to get the credential being rotated (secret_id, type,
+      new key metadata, and list of affected services).
+
+      For each affected service:
+      1. Locate the configuration file(s) that reference this credential using filesystem MCP
+         (search in config/, and any service config paths listed in data/inventory/secret-inventory.json)
+      2. Update configuration references: update secret names, key IDs, or config keys as appropriate
+         (never write raw secret values to config files)
+      3. If the secret is a GitHub Actions secret (location starts with "github-actions:"),
+         use the GitHub MCP to set the new secret value
+      4. Log every change to data/rotations/rotation-log.json
+
+      After all services are updated, write the final status back to data/rotations/in-progress.json
+      with services_updated list and any failed_services.
+
+      Emit your decision contract JSON on the last line:
+      { "verdict": "updated" | "failed", "services_updated": [...], "failed_services": [...] }
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    decision_contract:
+      required_fields: [verdict, services_updated, failed_services]
+    retry_policy:
+      max_attempts: 2
+      on_failure: fail
+
+  run-health-checks:
+    mode: command
+    command:
+      program: bash
+      args: ["-c", "scripts/check-health.sh 2>&1 | tee data/rotations/health-check-output.txt && echo 'Health check complete'"]
+      cwd_mode: project_root
+      timeout_secs: 180
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  verify-health:
+    mode: agent
+    agent: health-verifier
+    directive: |
+      Read data/rotations/health-check-output.txt (the raw health check output from the previous
+      command phase) and data/rotations/in-progress.json (the list of services just updated).
+      Also read config/health-checks.yaml for the expected status codes and endpoints.
+
+      For each service that was just rotated:
+      1. Find its HTTP response code in the health check output
+      2. Check the GitHub MCP for recent workflow run status on the affected repo (last 3 runs)
+      3. Determine health status:
+         - HTTP 200 and recent workflows passing = healthy
+         - HTTP 4xx/5xx or recent workflow failure = degraded or failed
+         - Cannot reach endpoint = failed
+
+      Distinguish: a transient failure (retry the health check) from a config error (rework config update).
+      If critical services (those marked critical in config/health-checks.yaml) are down = failed verdict.
+      If only non-critical services degraded = degraded verdict.
+
+      Emit your decision contract JSON on the last line:
+      { "verdict": "verified" | "degraded" | "failed", "healthy_services": [...], "failed_services": [...], "details": "..." }
+    capabilities:
+      mutates_state: false
+      writes_files: false
+    decision_contract:
+      required_fields: [verdict, healthy_services, failed_services, details]
+
+  revoke-old-credential:
+    mode: command
+    command:
+      program: bash
+      args: ["-c", "scripts/revoke-credential.sh {{dispatch_input}} 2>&1"]
+      cwd_mode: project_root
+      timeout_secs: 60
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  update-inventory:
+    mode: agent
+    agent: secret-auditor
+    directive: |
+      The rotation has been verified as successful. Now finalize the inventory records.
+
+      1. Read data/rotations/in-progress.json to get the secret_id and new credential metadata
+      2. Read data/inventory/secret-inventory.json
+      3. Update the inventory entry for this secret_id:
+         - Set status: valid
+         - Update last_rotated to today's date
+         - Update expires_at based on rotation policy max_age_days
+         - Clear any "exposed" flags
+      4. Append a rotation history entry to data/rotations/history.json:
+         { "secret_id": ..., "rotated_at": ..., "rotated_by": "ao-agent",
+           "previous_status": ..., "new_expires_at": ..., "services_updated": [...] }
+      5. If a GitHub issue exists for this secret (from plan-rotations phase), close it via GitHub MCP
+         with a comment: "Credential rotated successfully by AO secret-rotation pipeline."
+      6. Move data/rotations/in-progress.json to completed (append to data/rotations/completed.json)
+
+      Write all files via filesystem MCP.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  # ─── Workflow 3: weekly-rotation-batch ──────────────────────────────────────
+
+  collect-pending:
+    mode: command
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          python3 -c "
+          import json, sys
+          from datetime import datetime, timedelta
+
+          with open('data/inventory/secret-inventory.json') as f:
+              inventory = json.load(f)
+
+          today = datetime.utcnow().date()
+          threshold = today + timedelta(days=14)
+
+          batch = [
+              s for s in inventory.get('secrets', [])
+              if s.get('status') in ('expiring', 'expired')
+              and s.get('rotation_method') not in ('manual',)
+              and datetime.fromisoformat(s.get('expires_at', '2099-01-01')).date() <= threshold
+          ]
+          batch.sort(key=lambda s: s.get('expires_at', ''))
+
+          with open('data/rotations/weekly-batch.json', 'w') as f:
+              json.dump({'batch': batch, 'generated_at': datetime.utcnow().isoformat(), 'count': len(batch)}, f, indent=2)
+
+          print(f'Batch plan written: {len(batch)} secrets to rotate')
+          "
+      cwd_mode: project_root
+      timeout_secs: 60
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  execute-batch:
+    mode: agent
+    agent: rotation-planner
+    directive: |
+      Read data/rotations/weekly-batch.json which contains the batch of secrets to rotate this week.
+
+      Review the batch plan:
+      1. Confirm the rotation order is safest-first (least critical credentials first)
+         - Order: deferred < scheduled < immediate, within each group by owner team
+      2. For each secret in the batch with auto_rotate: true (check config/rotation-policy.yaml),
+         queue an individual rotate-secret workflow:
+         ao queue enqueue --title "<secret_id>" --description "Rotate <type> for <repo>" --workflow-ref rotate-secret
+      3. For secrets with auto_rotate: false, skip and note in the log
+      4. Update data/rotations/weekly-batch.json with queued_at timestamps for each queued secret
+
+      Emit your decision contract JSON on the last line:
+      { "verdict": "batch-queued" | "batch-empty", "queued_count": N, "skipped_count": N }
+    capabilities:
+      mutates_state: false
+      writes_files: true
+    decision_contract:
+      required_fields: [verdict, queued_count, skipped_count]
+
+  batch-summary:
+    mode: agent
+    agent: compliance-reporter
+    directive: |
+      Read data/rotations/weekly-batch.json (this week's batch plan),
+      data/rotations/history.json (completed rotations from last 7 days),
+      and data/inventory/secret-inventory.json (current state).
+
+      Produce reports/weekly-rotation-summary.md with:
+      1. Executive summary: rotated count, failed count, skipped count
+      2. Successfully rotated this week (table: secret_id, type, repo, rotated_at)
+      3. Failed or skipped (table: secret_id, reason)
+      4. Upcoming expirations next 30 days (sorted by urgency)
+      5. Risk assessment: any patterns of concern (e.g., same team consistently late,
+         high count of manual-only secrets, critical paths with old credentials)
+      6. Recommended actions for the next week
+
+      Write to reports/weekly-rotation-summary.md via filesystem MCP.
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  # ─── Workflow 4: monthly-compliance-audit ────────────────────────────────────
+
+  full-scan:
+    mode: command
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          mkdir -p data/audit
+          scripts/scan-secrets.sh 2>&1 | tee data/audit/monthly-scan.txt
+          gh secret list --json name,updatedAt 2>/dev/null | jq '.' > data/audit/github-secrets.json 2>/dev/null || echo '[]' > data/audit/github-secrets.json
+          cp data/rotations/history.json data/audit/rotation-history-snapshot.json 2>/dev/null || echo '[]' > data/audit/rotation-history-snapshot.json
+          echo "Full scan complete. Outputs in data/audit/"
+      cwd_mode: project_root
+      timeout_secs: 600
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  compliance-report:
+    mode: agent
+    agent: compliance-reporter
+    directive: |
+      Read all audit data: data/audit/monthly-scan.txt, data/audit/github-secrets.json,
+      data/audit/rotation-history-snapshot.json, data/inventory/secret-inventory.json,
+      and data/metrics/compliance-trends.json (historical trends).
+      Also read config/rotation-policy.yaml for policy requirements.
+
+      Produce reports/monthly-compliance-audit.md with:
+      1. Executive summary (overall compliance score as percentage)
+      2. Secret inventory summary (total by type and status, table format)
+      3. Rotation compliance rate by team (rotated_on_time / total_due * 100 per team)
+      4. Policy violations (secrets older than max_age_days — list with secret_id, age, owner)
+      5. Secret age analysis (average age by type, histogram buckets: <30d, 30-90d, 90-180d, 180-365d, >365d)
+      6. Trend analysis (compare this month to prior 3 months from compliance-trends.json)
+      7. Recommendations (policy changes, team-specific actions)
+
+      Write to reports/monthly-compliance-audit.md.
+      Update data/metrics/compliance-trends.json with this month's compliance_rate, violations_count,
+      rotated_count, and total_secrets. Use the current month (YYYY-MM) as the key.
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  risk-assessment:
+    mode: agent
+    agent: rotation-planner
+    directive: |
+      Read reports/monthly-compliance-audit.md and data/inventory/secret-inventory.json.
+      Identify systemic risks in the organization's secret management posture:
+
+      1. Compliance gaps: teams or secret types consistently below 80% rotation compliance
+      2. Age risk: types where actual average age significantly exceeds max_age_days
+      3. Coverage gaps: repos that have never had a secret audit
+      4. Manual dependency risk: count of critical secrets with auto_rotate: false
+      5. Concentration risk: single secrets depended on by many services
+
+      Based on findings, recommend specific policy changes:
+      - Propose shorter max_age_days for high-risk or high-value secret types
+      - Suggest enabling auto_rotate for any currently manual secrets that could be automated
+      - Identify repos that need immediate scanning
+
+      Write reports/risk-assessment.md with your assessment and recommendations.
+      If policy changes are warranted, propose updates to config/rotation-policy.yaml
+      (write the proposed updates as a separate block at the end of the report for human review —
+      do NOT automatically apply them).
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  approve-policy-changes:
+    mode: manual
+    directive: |
+      Review reports/risk-assessment.md. The compliance reporter has proposed policy changes
+      to config/rotation-policy.yaml.
+
+      Review the proposed changes in the "Proposed Policy Updates" section at the bottom of
+      reports/risk-assessment.md. If you approve, apply the changes to config/rotation-policy.yaml.
+      If you decline or want modifications, update the rotation-policy.yaml manually before continuing.
+
+      This is a required human gate — approve to proceed and trigger the next rotation cycle
+      with updated policies, or decline to keep current policies.

@@ -1,0 +1,15 @@
+schedules:
+  - id: daily-secret-audit
+    cron: "0 6 * * *"
+    workflow_ref: secret-audit
+    enabled: true
+
+  - id: weekly-rotation-batch
+    cron: "0 8 * * 1"
+    workflow_ref: weekly-rotation-batch
+    enabled: true
+
+  - id: monthly-compliance-audit
+    cron: "0 9 1 * *"
+    workflow_ref: monthly-compliance-audit
+    enabled: true
